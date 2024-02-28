@@ -1,53 +1,41 @@
-//! Example of using USB without a pre-defined class, but instead responding to
-//! raw USB control requests.
-//!
-//! The host computer can either:
-//! * send a command, with a 16-bit request ID, a 16-bit value, and an optional data buffer
-//! * request some data, with a 16-bit request ID, a 16-bit value, and a length of data to receive
-//!
-//! For higher throughput data, you can add some bulk endpoints after creating the alternate,
-//! but for low rate command/response, plain control transfers can be very simple and effective.
-//!
-//! Example code to send/receive data using `nusb`:
-
 #![no_std]
 #![no_main]
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::usb_otg::Driver;
-use embassy_stm32::{bind_interrupts, peripherals, usb_otg, Config};
-use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
-use embassy_usb::types::InterfaceNumber;
-use embassy_usb::{Builder, Handler};
-use embassy_usb_driver::{Endpoint, EndpointIn};
-use futures::future::join;
+use embassy_net::tcp::TcpSocket;
+use embassy_net::{Ipv4Address, Stack, StackResources};
+use embassy_stm32::eth::generic_smi::GenericSMI;
+use embassy_stm32::eth::{Ethernet, PacketQueue};
+use embassy_stm32::peripherals::ETH;
+use embassy_stm32::rng::Rng;
+use embassy_stm32::{bind_interrupts, eth, peripherals, rng, Config};
+use embassy_time::Timer;
+use embedded_io_async::Write;
+use rand_core::RngCore;
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
-    OTG_HS => usb_otg::InterruptHandler<peripherals::USB_OTG_HS>;
+    ETH => eth::InterruptHandler;
+    RNG => rng::InterruptHandler<peripherals::RNG>;
 });
 
+type Device = Ethernet<'static, ETH, GenericSMI>;
+
+#[embassy_executor::task]
+async fn net_task(stack: &'static Stack<Device>) -> ! {
+    stack.run().await
+}
+
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
-    info!("Hello World!");
-
-    #[cfg(not(debug_assertions))]
-    fn example() {
-        info!("Enabling caches for release build");
-        let mut cp = cortex_m::Peripherals::take().unwrap();
-        cp.SCB.enable_icache();
-        cp.SCB.enable_dcache(&mut cp.CPUID);
-    }
-
+async fn main(spawner: Spawner) -> ! {
     let mut config = Config::default();
     {
         use embassy_stm32::rcc::*;
         config.rcc.hsi = Some(HSIPrescaler::DIV1);
         config.rcc.csi = true;
-        config.rcc.hsi48 = Some(Hsi48Config {
-            sync_from_usb: true,
-        });
+        config.rcc.hsi48 = Some(Default::default()); // needed for RNG
         config.rcc.pll1 = Some(Pll {
             source: PllSource::HSI,
             prediv: PllPreDiv::DIV4,
@@ -64,140 +52,99 @@ async fn main(_spawner: Spawner) {
         config.rcc.apb4_pre = APBPrescaler::DIV2; // 100 Mhz
         config.rcc.voltage_scale = VoltageScale::Scale1;
     }
-
     let p = embassy_stm32::init(config);
+    info!("Hello World!");
 
-    // Create the driver, from the HAL.
-    let mut ep_out_buffer = [0u8; 512];
-    let mut config = embassy_stm32::usb_otg::Config::default();
-    config.vbus_detection = true;
-    let driver = Driver::new_fs(
-        p.USB_OTG_HS,
+    // Generate random seed.
+    let mut rng = Rng::new(p.RNG, Irqs);
+    let mut seed = [0; 8];
+    rng.fill_bytes(&mut seed);
+    let seed = u64::from_le_bytes(seed);
+
+    let mac_addr = [0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+
+    static PACKETS: StaticCell<PacketQueue<8, 8>> = StaticCell::new();
+    let device = Ethernet::new(
+        PACKETS.init(PacketQueue::<8, 8>::new()),
+        p.ETH,
         Irqs,
-        p.PA12,
-        p.PA11,
-        &mut ep_out_buffer,
-        config,
+        p.PA1,
+        p.PA2,
+        p.PC1,
+        p.PA7,
+        p.PC4,
+        p.PC5,
+        p.PG13,
+        p.PB13,
+        p.PG11,
+        GenericSMI::new(0),
+        mac_addr,
     );
 
-    // Create embassy-usb Config
-    let mut config = embassy_usb::Config::new(0xb16b, 0x00ba);
-    config.manufacturer = Some("mmskv");
-    config.product = Some("stm-fft");
-    config.serial_number = Some("69420");
+    let config = embassy_net::Config::dhcpv4(Default::default());
 
-    // Create embassy-usb DeviceBuilder using the driver and config.
-    // It needs some buffers for building the descriptors.
-    let mut device_descriptor = [0; 256];
-    let mut config_descriptor = [0; 256];
-    let mut bos_descriptor = [0; 256];
-    let mut msos_descriptor = [0; 256];
-    let mut control_buf = [0; 512];
-
-    let mut control = ControlHandler {
-        if_num: InterfaceNumber(0),
-    };
-
-    let mut builder = Builder::new(
-        driver,
+    // Init network stack
+    static STACK: StaticCell<Stack<Device>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    let stack = &*STACK.init(Stack::new(
+        device,
         config,
-        &mut device_descriptor,
-        &mut config_descriptor,
-        &mut bos_descriptor,
-        &mut msos_descriptor,
-        &mut control_buf,
-    );
+        RESOURCES.init(StackResources::<3>::new()),
+        seed,
+    ));
 
-    let mut func = builder.function(0xFF, 0, 0);
+    // Launch network task
+    unwrap!(spawner.spawn(net_task(&stack)));
 
-    // Control interface
-    let mut iface = func.interface();
-    let comm_if = iface.interface_number();
+    // Ensure DHCP configuration is up before trying connect
+    stack.wait_config_up().await;
 
-    // Data interface
-    let mut iface = func.interface();
-    let data_if = iface.interface_number();
-    let mut alt = iface.alt_setting(0x81, 0, 0, None);
-    let mut read_ep = alt.endpoint_bulk_out(64);
-    let mut write_ep = alt.endpoint_bulk_in(64);
+    info!("Network task initialized");
 
-    drop(func);
+    let mut tx_buffer = [0u8; 11680];
+    let mut deadbeef_buffer = [0u8; 11680];
+    let mut rx_buffer = [0u8; 1460];
 
-    control.if_num = comm_if;
-    builder.handler(&mut control);
-
-    let mut usb = builder.build();
-
-    let usb_fut = usb.run();
-
-    let read_fut = async {
-        read_ep.wait_enabled().await;
-
-        let total_size = 1024 * 1024;
-        let pattern: u32 = 0xDEADBEEF;
-        let mut data_chunk = [0u8; 64];
-
-        for chunk in data_chunk.chunks_mut(4) {
-            chunk.copy_from_slice(&pattern.to_be_bytes());
-        }
-
-        let mut sent = 0usize;
-        while sent < total_size {
-            write_ep.write(&data_chunk).await.unwrap();
-            sent += 64
-        }
-    };
-
-    join(usb_fut, read_fut).await;
-}
-
-struct ControlHandler {
-    if_num: InterfaceNumber,
-}
-
-impl Handler for ControlHandler {
-    fn control_out<'a>(&'a mut self, req: Request, buf: &'a [u8]) -> Option<OutResponse> {
-        // Log the request before filtering to help with debugging.
-        info!("Got control_out, request={}, buf={:a}", req, buf);
-
-        // Only handle Vendor request types to an Interface.
-        if req.request_type != RequestType::Vendor || req.recipient != Recipient::Interface {
-            return None;
-        }
-
-        // Ignore requests to other interfaces.
-        if req.index != self.if_num.0 as u16 {
-            return None;
-        }
-
-        // Accept request 100, value 200, reject others.
-        if req.request == 100 && req.value == 200 {
-            Some(OutResponse::Accepted)
-        } else {
-            Some(OutResponse::Rejected)
-        }
+    // Fill the tx_buffer with the pattern 0xDEADBEEF
+    for chunk in deadbeef_buffer.chunks_mut(4) {
+        chunk.copy_from_slice(&0xDEADBEEFu32.to_ne_bytes());
     }
 
-    /// Respond to DeviceToHost control messages, where the host requests some data from us.
-    fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
-        info!("Got control_in, request={}", req);
+    // Total size to send is 10 MB
+    let total_size_to_send = 10_000_000; // 10 MB in bytes
+    let mut total_sent = 0usize;
 
-        // Only handle Vendor request types to an Interface.
-        if req.request_type != RequestType::Vendor || req.recipient != Recipient::Interface {
-            return None;
+    loop {
+        let mut socket = TcpSocket::new(&stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+
+        let remote_endpoint = (Ipv4Address::new(192, 168, 88, 69), 8000);
+        info!("connecting...");
+        let r = socket.connect(remote_endpoint).await;
+        if let Err(e) = r {
+            info!("connect error: {:?}", e);
+            Timer::after_secs(1).await;
+            continue;
+        }
+        info!("connected!");
+
+        while total_sent < total_size_to_send {
+            let r = socket.write_all(&deadbeef_buffer).await;
+            if let Err(e) = r {
+                info!("write error: {:?}", e);
+                break;
+            }
+            total_sent += 11680;
         }
 
-        // Ignore requests to other interfaces.
-        if req.index != self.if_num.0 as u16 {
-            return None;
+        if total_sent >= total_size_to_send {
+            // Successfully sent 10 MB of data, you might want to close the socket or reset total_sent
+            info!("Successfully sent 10 MB of data");
+            socket.close();
         }
 
-        // Respond "hello" to request 101, value 201, when asked for 5 bytes, otherwise reject.
-        if req.request == 101 && req.value == 201 && req.length == 5 {
-            buf[..5].copy_from_slice(b"hello");
-            Some(InResponse::Accepted(&buf[..5]))
-        } else {
-            Some(InResponse::Rejected)
-        }
+        // Reset for a potential reconnection and retry
+        total_sent = 0;
+        Timer::after_secs(1).await;
     }
 }
