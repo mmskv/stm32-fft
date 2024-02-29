@@ -10,11 +10,13 @@ use embassy_stm32::eth::{Ethernet, PacketQueue};
 use embassy_stm32::peripherals::ETH;
 use embassy_stm32::rng::Rng;
 use embassy_stm32::{bind_interrupts, eth, peripherals, rng, Config};
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer, TICK_HZ};
 use embedded_io_async::Write;
 use rand_core::RngCore;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
+
+mod util;
 
 bind_interrupts!(struct Irqs {
     ETH => eth::InterruptHandler;
@@ -28,8 +30,38 @@ async fn net_task(stack: &'static Stack<Device>) -> ! {
     stack.run().await
 }
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) -> ! {
+#[embassy_executor::task]
+async fn log_idle_time() -> ! {
+    /// 1000 is a scale factor, defmt macro should be adjusted according to it's length
+    /// rounding + avoiding floating point operations
+    ///
+    /// XXX: as it's not an interrupt executor, tasks that take more than one second won't
+    /// display load correctly
+    const SCALE: i32 = 1000;
+    loop {
+        unsafe {
+            let idle_ticks = util::EXECUTOR.as_mut().unwrap().idle_duration.as_ticks();
+            let cpu_load = (SCALE * (TICK_HZ - idle_ticks) as i32) / TICK_HZ as i32;
+            info!("CPU load: 0.{:03}", cpu_load);
+            util::EXECUTOR.as_mut().unwrap().idle_duration = Duration::from_ticks(0);
+            Timer::after_secs(1).await;
+        }
+    }
+}
+
+#[cortex_m_rt::entry]
+fn main() -> ! {
+    let e = util::Executor::take();
+    e.run(|spawner| {
+        unwrap!(spawner.spawn(async_main(spawner)));
+        unwrap!(spawner.spawn(log_idle_time()));
+    })
+}
+
+#[embassy_executor::task]
+async fn async_main(spawner: Spawner) -> ! {
+    info!("Hello world");
+
     let mut config = Config::default();
     {
         use embassy_stm32::rcc::*;
